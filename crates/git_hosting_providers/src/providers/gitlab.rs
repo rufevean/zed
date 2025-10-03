@@ -1,11 +1,18 @@
 use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
+use futures::AsyncReadExt;
+use gpui::SharedString;
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
+use regex::Regex;
+use serde::Deserialize;
 use url::Url;
 
 use git::{
     BuildCommitPermalinkParams, BuildPermalinkParams, GitHostingProvider, ParsedGitRemote,
-    RemoteUrl,
+    PullRequest, RemoteUrl,
 };
 
 use crate::get_host_from_git_remote_url;
@@ -14,6 +21,44 @@ use crate::get_host_from_git_remote_url;
 pub struct Gitlab {
     name: String,
     base_url: Url,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    pub id: u64,
+    pub avatar_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetails {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    commit: Commit,
+    author: Option<User>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Commit {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    author: Author,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    email: String,
 }
 
 impl Gitlab {
@@ -46,8 +91,64 @@ impl Gitlab {
             Url::parse(&format!("https://{}", host))?,
         ))
     }
+
+    async fn fetch_gitlab_commit_author(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: &str,
+        client: &Arc<dyn HttpClient>,
+    ) -> Result<Option<User>> {
+        println!("FETCH_GITLAB_COMMIT_AUTHOR GETTING USED");
+        let Some(host) = self.base_url.host_str() else {
+            bail!("failed to get host from gitlab base url");
+        };
+
+        // GitLab API uses project path encoding (owner/repo becomes owner%2Frepo)
+        let project_path = format!("{}%2F{}", repo_owner, repo);
+        let url =
+            format!("https://{host}/api/v4/projects/{project_path}/repository/commits/{commit}");
+
+        let mut request = Request::get(&url)
+            .header("Content-Type", "application/json")
+            .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+        if let Ok(gitlab_token) = std::env::var("GITLAB_TOKEN") {
+            request = request.header("PRIVATE-TOKEN", gitlab_token);
+        }
+
+        let mut response = client
+            .send(request.body(AsyncBody::default())?)
+            .await
+            .with_context(|| format!("error fetching GitLab commit details at {:?}", url))?;
+
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        if response.status().is_client_error() {
+            let text = String::from_utf8_lossy(body.as_slice());
+            bail!(
+                "status error {}, response: {text:?}",
+                response.status().as_u16()
+            );
+        }
+
+        let body_str = std::str::from_utf8(&body)?;
+
+        serde_json::from_str::<CommitDetails>(body_str)
+            .map(|commit| commit.author)
+            .context("failed to deserialize GitLab commit details")
+    }
 }
 
+fn gitlab_pull_request_number_regex() -> &'static Regex {
+    static GITLAB_PR_NUMBER_REGEX: LazyLock<Regex> =
+        // Fixed: Now matches (!123) format like GitHub's (#123)
+        LazyLock::new(|| Regex::new(r"!\d+").unwrap());
+    &GITLAB_PR_NUMBER_REGEX
+}
+
+#[async_trait]
 impl GitHostingProvider for Gitlab {
     fn name(&self) -> String {
         self.name.clone()
@@ -58,7 +159,8 @@ impl GitHostingProvider for Gitlab {
     }
 
     fn supports_avatars(&self) -> bool {
-        false
+        // Enable avatars for public GitLab instance
+        &self.name == "GitLab"
     }
 
     fn format_line_number(&self, line: u32) -> String {
@@ -99,6 +201,48 @@ impl GitHostingProvider for Gitlab {
             .join(&format!("{owner}/{repo}/-/commit/{sha}"))
             .unwrap()
     }
+    fn extract_pull_request(&self, remote: &ParsedGitRemote, message: &str) -> Option<PullRequest> {
+        println!("EXTRACTING PULL REQ IS GETTING USED");
+        println!("Full commit message:\n{}", message);
+        println!("fetching details of remote {:?}",remote);
+        // Try regex match
+        let capture = match gitlab_pull_request_number_regex().captures(message) {
+            Some(c) => {
+                println!("Regex matched! {:?}", c);
+                c
+            }
+            None => {
+                println!("Regex did NOT match any merge request number.");
+                return None;
+            }
+        };
+
+        // Extract MR number
+        let number_str = &capture[0];
+        println!("Matched raw capture: '{}'", number_str);
+
+        // Strip "!" and parse number
+        let number = match number_str[1..].parse::<u32>() {
+            Ok(n) => {
+                println!("Parsed merge request number: {}", n);
+                n
+            }
+            Err(e) => {
+                println!("Failed to parse merge request number: {:?}", e);
+                return None;
+            }
+        };
+
+        // Build the MR URL
+        let mut url = self.base_url.clone();
+        let path = format!("{}/{}/-/merge_requests/{}", remote.owner, remote.repo, number);
+        url.set_path(&path);
+
+        println!("Constructed Pull Request URL: {}", url);
+
+        Some(PullRequest { number, url })
+    }
+
 
     fn build_permalink(&self, remote: ParsedGitRemote, params: BuildPermalinkParams) -> Url {
         let ParsedGitRemote { owner, repo } = remote;
@@ -122,10 +266,32 @@ impl GitHostingProvider for Gitlab {
         );
         permalink
     }
+
+    async fn commit_author_avatar_url(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: SharedString,
+        http_client: Arc<dyn HttpClient>,
+    ) -> Result<Option<Url>> {
+        println!("COMMIT AUTHOR AVATAR URL GETTING HIT IN GITLAB");
+        let commit = commit.to_string();
+        let avatar_url = self
+            .fetch_gitlab_commit_author(repo_owner, repo, &commit, &http_client)
+            .await?
+            .map(|author| -> Result<Url, url::ParseError> {
+                let mut url = Url::parse(&author.avatar_url)?;
+                url.set_query(Some("size=128"));
+                Ok(url)
+            })
+            .transpose()?;
+        Ok(avatar_url)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -296,5 +462,47 @@ mod tests {
 
         let expected_url = "https://gitlab-instance.big-co.com/zed-industries/zed/-/blob/b2efec9824c45fcc90c9a7eb107a50d1772a60aa/crates/zed/src/main.rs";
         assert_eq!(permalink.to_string(), expected_url.to_string())
+    }
+
+    #[test]
+    fn test_gitlab_merge_requests() {
+        let remote = ParsedGitRemote {
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
+        };
+
+        let gitlab = Gitlab::public_instance();
+        let message = "This does not contain a merge request";
+        assert!(gitlab.extract_pull_request(&remote, message).is_none());
+
+        // Merge request number at end of first line
+        let message = indoc! {r#"
+            project panel: do not expand collapsed worktrees on "collapse all entries" (!10687)
+
+            Fixes #10597
+
+            Release Notes:
+
+            - Fixed "project panel: collapse all entries" expanding collapsed worktrees.
+            "#
+        };
+
+        assert_eq!(
+            gitlab
+                .extract_pull_request(&remote, message)
+                .unwrap()
+                .url
+                .as_str(),
+            "https://gitlab.com/zed-industries/zed/-/merge_requests/10687"
+        );
+
+        // Merge request number in middle of line, which we want to ignore
+        let message = indoc! {r#"
+            Follow-up to !10687 to fix problems
+
+            See the original MR, this is a fix.
+            "#
+        };
+        assert_eq!(gitlab.extract_pull_request(&remote, message), None);
     }
 }
